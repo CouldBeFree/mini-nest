@@ -7,6 +7,8 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/src/index.js",
+    "dev": "nodemon",
+    "test:watch": "nodemon --watch src --watch test --ext ts --exec \"npm test\"",
     "typecheck": "tsc --noEmit",
     "clean": "rm -rf dist",
     "pretest": "tsc",
@@ -23,6 +25,7 @@
   "license": "ISC",
   "devDependencies": {
     "@types/node": "^26.2.0",
+    "nodemon": "^3.1.14",
     "typescript": "^6.0.3"
   },
   "dependencies": {

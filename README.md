@@ -21,7 +21,14 @@ guards, interceptors, фільтри.
 npm install
 npm test        # tsc + node --test; має бути 8 passed, exit 0
 npm start       # демо: контейнер збирає граф і друкує "[log] Привіт, світ!"
+
+npm run dev        # nodemon: перезбирає (tsc) і перезапускає app на кожну зміну .ts у src/
+npm run test:watch # nodemon: перезапускає тести на кожну зміну в src/ або test/
 ```
+
+> Чому саме перезбірка, а не запуск `.ts` напряму: декоратори потребують компіляції
+> через `tsc` (нативний type-stripping Node не емітить `design:paramtypes`), тому
+> dev-режим на кожну зміну робить `tsc && node dist/…`, а не запускає джерело як є.
 
 У Docker (перевикористовуючи сервіс `api`):
 
