@@ -1,0 +1,31 @@
+{
+  "name": "mini-nest",
+  "version": "1.0.0",
+  "description": "Мінімальний IoC-контейнер у стилі NestJS — читає design:paramtypes і сам збирає граф залежностей (частина 1 з 3).",
+  "type": "commonjs",
+  "main": "dist/src/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/src/index.js",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist",
+    "pretest": "tsc",
+    "test": "node --test --enable-source-maps \"dist/test/**/*.test.js\""
+  },
+  "keywords": [
+    "ioc",
+    "di",
+    "dependency-injection",
+    "decorators",
+    "reflect-metadata"
+  ],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "typescript": "^6.0.3"
+  },
+  "dependencies": {
+    "reflect-metadata": "^0.2.2"
+  }
+}

@@ -1,0 +1,7 @@
+services:
+  api:
+    build: .
+    working_dir: /app
+    # Запуск тестів у контейнері:
+    #   docker compose run --rm api npm test
+    command: npm test
