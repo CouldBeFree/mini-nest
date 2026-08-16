@@ -1,37 +1,16 @@
 import 'reflect-metadata';
-import { Container } from './container';
-import { Injectable } from './decorators/injectable';
-import { Inject } from './decorators/inject';
-import { CONFIG } from './tokens';
+import { createApp } from './app';
 
-// Демонстрація: контейнер сам збирає граф Greeter -> Logger та підставляє
-// конфіг за токеном CONFIG. Запуск: `npm start` (після `npm run build`).
+// Точка входу для `npm start`: піднімаємо HTTP-сервер на маршрутах-декораторах.
+// Спробуйте:
+//   curl localhost:3000/users
+//   curl localhost:3000/users/1
+//   curl localhost:3000/users?limit=1
+//   curl -X POST localhost:3000/users -H 'content-type: application/json' \
+//        -d '{"email":"grace@example.com","name":"Grace"}'
+//   curl -X POST localhost:3000/users -H 'content-type: application/json' \
+//        -d '{"email":"not-an-email","name":"x"}'   # → 400 з полем email
 
-interface AppConfig {
-  greeting: string;
-}
+const PORT = Number(process.env.PORT ?? 3000);
 
-@Injectable()
-class Logger {
-  log(message: string): void {
-    console.log(`[log] ${message}`);
-  }
-}
-
-@Injectable()
-class Greeter {
-  constructor(
-    private readonly logger: Logger, //          резолвиться за типом
-    @Inject(CONFIG) private readonly config: AppConfig, // за токеном
-  ) {}
-
-  greet(name: string): void {
-    this.logger.log(`${this.config.greeting}, ${name}!`);
-  }
-}
-
-const container = new Container();
-container.register(CONFIG, { useValue: { greeting: 'Привіт' } });
-
-// Один виклик resolve — і весь граф зібрано.
-container.resolve(Greeter).greet('світ');
+createApp().dispatcher.listen(PORT);
