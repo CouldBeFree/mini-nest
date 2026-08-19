@@ -63,6 +63,12 @@ export class Router {
           Reflect.getMetadata('design:paramtypes', proto, route.handlerName) ?? [],
       });
     }
+
+    // Ключове: після додавання нових маршрутів упорядковуємо всю таблицю за
+    // специфічністю, щоб літеральні шляхи стояли перед `:param`-джокерами. Без
+    // цього виграє перший збіг за порядком реєстрації: `@Get(':id')`, оголошений
+    // раніше за `@Get('me')`, перехопив би `/users/me` і зробив `me()` мертвим.
+    this.#routes.sort(bySpecificity);
     return this;
   }
 
@@ -74,7 +80,9 @@ export class Router {
   /**
    * Знайти маршрут за методом і шляхом. Повертає `null`, якщо збігу немає.
    * Матчинг посегментний: літеральний сегмент має збігтися точно, а `:name`
-   * — «джокер», що захоплює будь-яке значення в змінну `name`.
+   * — «джокер», що захоплює будь-яке значення в змінну `name`. Таблиця вже
+   * відсортована за специфічністю (див. `bySpecificity`), тож перший збіг —
+   * найбільш конкретний: `/users/me` виграє в `/users/:id`.
    */
   match(method: string, pathname: string): RouteMatch | null {
     const reqSegments = toSegments(pathname);
@@ -112,4 +120,22 @@ function joinPath(prefix: string, path: string): string {
 /** Розбити шлях на непорожні сегменти: `/users/:id` → `['users', ':id']`. */
 function toSegments(pathname: string): string[] {
   return pathname.split('/').filter((s) => s.length > 0);
+}
+
+/**
+ * Компаратор специфічності: більш конкретний маршрут — раніше в таблиці.
+ * Сегменти зважуємо зліва направо; на першому, де маршрути різняться типом,
+ * літерал специфічніший за `:param`. Тому `/users/me` (літерал) стає перед
+ * `/users/:id` (джокер) незалежно від порядку декораторів. Для маршрутів
+ * однакової специфічності повертаємо 0 — стабільне сортування Node зберігає
+ * їх у порядку реєстрації.
+ */
+function bySpecificity(a: CompiledRoute, b: CompiledRoute): number {
+  const shared = Math.min(a.segments.length, b.segments.length);
+  for (let i = 0; i < shared; i++) {
+    const aParam = a.segments[i].startsWith(':');
+    const bParam = b.segments[i].startsWith(':');
+    if (aParam !== bParam) return aParam ? 1 : -1; // літерал (не `:param`) — раніше
+  }
+  return 0;
 }

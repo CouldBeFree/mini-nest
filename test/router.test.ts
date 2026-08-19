@@ -52,6 +52,36 @@ test('match повертає null для невідомого шляху або 
   assert.equal(router.match('DELETE', '/users/1'), null);
 });
 
+// Порядок декораторів навмисно «пастковий»: `:id` оголошено ПЕРЕД `me`.
+// Наївний first-match-wins віддав би `/spec/me` у byId (`:id` захопив би 'me').
+@Controller('spec')
+class SpecController {
+  @Get(':id')
+  byId(@Param('id') _id: string) {
+    return { hit: 'byId' };
+  }
+
+  @Get('me')
+  me() {
+    return { hit: 'me' };
+  }
+}
+
+test('специфічний маршрут виграє в :param незалежно від порядку реєстрації', () => {
+  const router = new Router().register(SpecController);
+
+  // /spec/me має піти в літеральний me(), а не в :id — попри те, що :id оголошено раніше
+  const me = router.match('GET', '/spec/me');
+  assert.ok(me, 'маршрут /spec/me має знайтись');
+  assert.equal(me.route.handlerName, 'me');
+
+  // а конкретний id усе одно потрапляє в :param
+  const byId = router.match('GET', '/spec/42');
+  assert.ok(byId, 'маршрут /spec/42 має знайтись');
+  assert.equal(byId.route.handlerName, 'byId');
+  assert.equal(byId.pathParams.id, '42');
+});
+
 test('параметр-декоратор пише в метадані source+name за індексом аргументу', () => {
   // Це підтверджує підказку: index — і є ключ мапи.
   const map = getParamMap(DemoController, 'getOne');
