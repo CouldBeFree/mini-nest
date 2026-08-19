@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { AddressInfo } from 'node:net';
 import { Container } from '../src/container';
-import { Dispatcher } from '../src/dispatcher';
+import { Dispatcher, HttpResponse } from '../src/dispatcher';
 import { UserController } from '../src/users/user.controller';
 import { UserService } from '../src/users/user.service';
 import { CreateUserDto } from '../src/dto/create-user.dto';
@@ -123,6 +123,63 @@ test('тіло в межах ліміту читається нормально 
     });
     assert.equal(res.status, 201);
   });
+});
+
+test('ланцюжок обгортає виклик обробника: interceptor трансформує результат (ДЗ#8-seam)', async () => {
+  const dispatcher = new Dispatcher(new Container()).register(UserController);
+  // Ланка-інтерсептор: викликає обробник і обгортає його результат.
+  dispatcher.use(async (ctx, next) => {
+    const result = await next();
+    return { wrapped: result, handler: ctx.handlerName };
+  });
+  await withServer(dispatcher, async (base) => {
+    const res = await fetch(`${base}/users/1`);
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.handler, 'getOne'); // ланка бачить контекст маршруту
+    assert.equal(body.wrapped.id, 1); // і обгорнула справжній результат обробника
+  });
+});
+
+test('ланка може відхилити запит, не викликаючи обробник (guard-стиль)', async () => {
+  let handlerRan = false;
+  const dispatcher = new Dispatcher(new Container()).register(UserController);
+  // Guard: НЕ викликає next() → обробник не запускається зовсім.
+  dispatcher.use(async () => new HttpResponse(403, { statusCode: 403, message: 'Forbidden' }));
+  dispatcher.use(async (_ctx, next) => {
+    handlerRan = true; // ця ланка стоїть глибше за guard — до неї не має дійти
+    return next();
+  });
+  await withServer(dispatcher, async (base) => {
+    const res = await fetch(`${base}/users/1`);
+    assert.equal(res.status, 403);
+    const body = await res.json();
+    assert.equal(body.message, 'Forbidden');
+  });
+  assert.equal(handlerRan, false, 'глибша ланка не мала виконатись після відмови guard');
+});
+
+test('кілька ланок — onion-порядок: зовнішня обгортає внутрішню', async () => {
+  const order: string[] = [];
+  const dispatcher = new Dispatcher(new Container()).register(UserController);
+  dispatcher
+    .use(async (_ctx, next) => {
+      order.push('A:before');
+      const r = await next();
+      order.push('A:after');
+      return r;
+    })
+    .use(async (_ctx, next) => {
+      order.push('B:before');
+      const r = await next();
+      order.push('B:after');
+      return r;
+    });
+  await withServer(dispatcher, async (base) => {
+    await fetch(`${base}/users/1`);
+  });
+  // Зареєстрована першою (A) — зовнішня: обгортає B, а B обгортає обробник.
+  assert.deepEqual(order, ['A:before', 'B:before', 'B:after', 'A:after']);
 });
 
 test('валідація пропускає: у метод приходить екземпляр CreateUserDto, не plain-обʼєкт', async () => {

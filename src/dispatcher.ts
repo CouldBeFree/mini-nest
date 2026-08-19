@@ -27,6 +27,39 @@ export class PayloadTooLargeError extends Error {
 export const DEFAULT_MAX_BODY_BYTES = 1024 * 1024;
 
 /**
+ * Контекст виконання одного запиту — усе, що ланки ланцюжка бачать навколо
+ * виклику обробника. Саме сюди ДЗ#8 (guards / interceptors) дивитиметься, щоб
+ * вирішити «пускати далі?» чи «як трансформувати результат»: маршрут і його
+ * метадані є в `route`, залежності — через `container`, аргументи методу —
+ * у мутабельному `args` (інтерсептор може їх підмінити ДО виклику).
+ */
+export interface ExecutionContext {
+  readonly req: http.IncomingMessage;
+  readonly res: http.ServerResponse;
+  readonly url: URL;
+  readonly route: CompiledRoute;
+  readonly pathParams: Record<string, string>;
+  readonly container: Container;
+  /** Екземпляр контролера з контейнера. */
+  readonly controller: Record<string, (...a: unknown[]) => unknown>;
+  /** Імʼя методу-обробника на контролері. */
+  readonly handlerName: string;
+  /** Аргументи для методу (після пайпів); ланка може змінити їх до `next()`. */
+  args: unknown[];
+}
+
+/** Наступна ланка: викликає решту ланцюжка й повертає результат обробника. */
+export type Next = () => Promise<unknown>;
+
+/**
+ * Ланка навколо виклику обробника (onion-стиль, як у Nest interceptors).
+ * Викликає `next()` — і те, що поверне, може лишити як є, обгорнути або
+ * підмінити; або **не** викликати `next()` зовсім — тоді обробник не
+ * запуститься (так поводиться guard, що відхиляє запит).
+ */
+export type Middleware = (ctx: ExecutionContext, next: Next) => Promise<unknown>;
+
+/**
  * Диспетчер: HTTP-шар поверх `node:http`.
  *
  * Життєвий цикл запиту:
@@ -36,12 +69,20 @@ export const DEFAULT_MAX_BODY_BYTES = 1024 * 1024;
  *      `413`, якщо тіло перевищує ліміт байтів);
  *   4) зібрати масив аргументів за мапою параметр-декораторів
  *      (@Body проходить через ValidationPipe → `400` на невалідне тіло);
- *   5) дістати екземпляр контролера з контейнера (частина 1) і викликати метод;
+ *   5) дістати екземпляр контролера з контейнера (частина 1) і викликати метод
+ *      через ланцюжок ланок (`#runChain`) — точка розширення для ДЗ#8
+ *      (guards / interceptors); без зареєстрованих ланок це просто виклик методу;
  *   6) серіалізувати результат у JSON.
  */
 export class Dispatcher {
   readonly #router = new Router();
   readonly #pipe = new ValidationPipe();
+  /**
+   * Ланки навколо виклику обробника. Порожній список = виклик «як є» (поточна
+   * поведінка). ДЗ#8 додаватиме сюди guards/interceptors через `use(...)`,
+   * не чіпаючи `#dispatch`.
+   */
+  readonly #chain: Middleware[] = [];
 
   /**
    * Контейнер приходить ззовні — той самий, що й у частині 1. Завдяки цьому
@@ -59,6 +100,16 @@ export class Dispatcher {
   /** Зареєструвати контролери (їхні маршрути читаються з метаданих). */
   register(...controllers: Constructor[]): this {
     for (const controller of controllers) this.#router.register(controller);
+    return this;
+  }
+
+  /**
+   * Додати ланки навколо виклику обробника (у порядку реєстрації — зовнішні
+   * першими). Це точка розширення для ДЗ#8: guards, interceptors, filters
+   * підключаються сюди, а `#dispatch` лишається незмінним.
+   */
+  use(...middleware: Middleware[]): this {
+    this.#chain.push(...middleware);
     return this;
   }
 
@@ -134,7 +185,21 @@ export class Dispatcher {
       string,
       (...a: unknown[]) => unknown
     >;
-    const result = await controller[match.route.handlerName](...args);
+
+    // Виклик обробника йде через ланцюжок: без ланок — це просто виклик методу,
+    // із ланками (ДЗ#8) — guards/interceptors навколо нього.
+    const ctx: ExecutionContext = {
+      req,
+      res,
+      url,
+      route: match.route,
+      pathParams: match.pathParams,
+      container: this.container,
+      controller,
+      handlerName: match.route.handlerName,
+      args,
+    };
+    const result = await this.#runChain(ctx);
 
     if (result instanceof HttpResponse) {
       this.#send(res, result.status, result.body);
@@ -142,6 +207,25 @@ export class Dispatcher {
     }
     // POST за замовчуванням — 201 Created, решта — 200 OK (як у Nest).
     this.#send(res, match.route.method === 'POST' ? 201 : 200, result);
+  }
+
+  /**
+   * Скласти onion-ланцюжок навколо виклику обробника й запустити його.
+   *
+   * Термінальна ланка — власне виклик методу контролера. `reduceRight`
+   * обгортає її ланками у зворотному порядку, тож зовнішня ланка бачить `next`,
+   * який веде до наступної і врешті — до самого обробника. Порожній `#chain`
+   * дає рівно `terminal()` — тобто поведінку «виклик як є», без накладних.
+   */
+  #runChain(ctx: ExecutionContext): Promise<unknown> {
+    const terminal: Next = () =>
+      Promise.resolve(ctx.controller[ctx.handlerName](...ctx.args));
+
+    const composed = this.#chain.reduceRight<Next>(
+      (next, middleware) => () => middleware(ctx, next),
+      terminal,
+    );
+    return composed();
   }
 
   /** Чи має цей маршрут хоч один параметр із джерелом `body`. */
