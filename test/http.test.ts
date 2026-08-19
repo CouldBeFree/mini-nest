@@ -97,6 +97,34 @@ test('битий JSON у тілі → 400, а не 500', async () => {
   });
 });
 
+test('завелике тіло → 413, а не роздування памʼяті (лічильник байтів)', async () => {
+  // Ліміт 16 байтів — тіло свідомо більше, тож читання має обірватись на 413.
+  const tiny = new Dispatcher(new Container(), 16).register(UserController);
+  await withServer(tiny, async (base) => {
+    const res = await fetch(`${base}/users`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ email: 'grace@example.com', name: 'Grace' }), // >16 байтів
+    });
+    assert.equal(res.status, 413);
+    const body = await res.json();
+    assert.equal(body.statusCode, 413);
+  });
+});
+
+test('тіло в межах ліміту читається нормально (413 не спрацьовує зайве)', async () => {
+  // Той самий валідний запит зі щедрим лімітом проходить як завжди.
+  const roomy = new Dispatcher(new Container(), 1024).register(UserController);
+  await withServer(roomy, async (base) => {
+    const res = await fetch(`${base}/users`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ email: 'grace@example.com', name: 'Grace' }),
+    });
+    assert.equal(res.status, 201);
+  });
+});
+
 test('валідація пропускає: у метод приходить екземпляр CreateUserDto, не plain-обʼєкт', async () => {
   // Пробний контролер ловить те, що реально дійшло до обробника через диспетчер.
   let received: unknown;

@@ -15,13 +15,25 @@ export class HttpResponse<T = unknown> {
   ) {}
 }
 
+/** Тіло запиту перевищило ліміт байтів — диспетчер відповість `413`. */
+export class PayloadTooLargeError extends Error {
+  constructor(public readonly limit: number) {
+    super(`Request body exceeds limit of ${limit} bytes`);
+    this.name = 'PayloadTooLargeError';
+  }
+}
+
+/** Стеля розміру тіла за замовчуванням — 1 MiB. */
+export const DEFAULT_MAX_BODY_BYTES = 1024 * 1024;
+
 /**
  * Диспетчер: HTTP-шар поверх `node:http`.
  *
  * Життєвий цикл запиту:
  *   1) розібрати URL (шлях + query);
  *   2) знайти маршрут у роутері (`404`, якщо збігу немає);
- *   3) за потреби зчитати й розпарсити JSON-тіло (`400` на битий JSON);
+ *   3) за потреби зчитати й розпарсити JSON-тіло (`400` на битий JSON,
+ *      `413`, якщо тіло перевищує ліміт байтів);
  *   4) зібрати масив аргументів за мапою параметр-декораторів
  *      (@Body проходить через ValidationPipe → `400` на невалідне тіло);
  *   5) дістати екземпляр контролера з контейнера (частина 1) і викликати метод;
@@ -35,8 +47,14 @@ export class Dispatcher {
    * Контейнер приходить ззовні — той самий, що й у частині 1. Завдяки цьому
    * контролери й сервіси живуть як singletons: сервіс, який дістане тест, — той
    * самий екземпляр, що інжектнутий у контролер.
+   *
+   * `maxBodyBytes` — стеля розміру тіла запиту; за перевищенням читання
+   * припиняється й повертається `413` (див. `#readJson`).
    */
-  constructor(private readonly container: Container = new Container()) {}
+  constructor(
+    private readonly container: Container = new Container(),
+    private readonly maxBodyBytes: number = DEFAULT_MAX_BODY_BYTES,
+  ) {}
 
   /** Зареєструвати контролери (їхні маршрути читаються з метаданих). */
   register(...controllers: Constructor[]): this {
@@ -99,6 +117,13 @@ export class Dispatcher {
       }
       if (err instanceof SyntaxError) {
         this.#send(res, 400, { statusCode: 400, message: err.message });
+        return;
+      }
+      if (err instanceof PayloadTooLargeError) {
+        this.#send(res, 413, { statusCode: 413, message: err.message });
+        // Відповідь пішла — тепер обриваємо недочитане завантаження, щоб клієнт,
+        // який ще шле тіло, не тримав зʼєднання відкритим.
+        req.destroy();
         return;
       }
       throw err; // інше — у 500-обгортку в handle()
@@ -168,13 +193,41 @@ export class Dispatcher {
     }
   }
 
-  /** Зібрати чанки тіла й розпарсити JSON. Порожнє тіло → `{}`. */
+  /**
+   * Зібрати чанки тіла й розпарсити JSON. Порожнє тіло → `{}`.
+   *
+   * Рахуємо накопичені байти й на перевищенні `maxBodyBytes` зупиняємо потік і
+   * кидаємо `PayloadTooLargeError` — інакше достатньо великий (чи нескінченний)
+   * POST роздув би памʼять процесу. Сокет НЕ рвемо тут (413-відповідь не встигла
+   * б піти) — обрив робить обробник помилок у #dispatch після відповіді.
+   */
   #readJson(req: http.IncomingMessage): Promise<unknown> {
     return new Promise((resolve, reject) => {
       const chunks: Buffer[] = [];
-      req.on('data', (chunk: Buffer) => chunks.push(chunk));
-      req.on('error', reject);
+      let size = 0;
+      let done = false; // щоб не обробляти 'end' після аварійного розриву
+
+      req.on('data', (chunk: Buffer) => {
+        if (done) return;
+        size += chunk.length;
+        if (size > this.maxBodyBytes) {
+          done = true;
+          // Зупиняємо потік (більше нічого не буферимо), але НЕ рвемо сокет —
+          // інакше 413-відповідь не встигне піти. Обрив зробить обробник помилок
+          // у #dispatch уже ПІСЛЯ того, як відповідь відправлено.
+          req.pause();
+          reject(new PayloadTooLargeError(this.maxBodyBytes));
+          return;
+        }
+        chunks.push(chunk);
+      });
+
+      req.on('error', (err) => {
+        if (!done) reject(err);
+      });
+
       req.on('end', () => {
+        if (done) return;
         const raw = Buffer.concat(chunks).toString('utf8').trim();
         if (raw === '') return resolve({});
         try {
