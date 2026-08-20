@@ -3,6 +3,7 @@ import type { Constructor } from './tokens';
 import { getControllerPrefix, isController } from './decorators/controller';
 import { getRoutes, type HttpMethod } from './decorators/methods';
 import { getParamMap, type ParamMap } from './decorators/params';
+import { getGuards, type GuardClass } from './decorators/use-guards';
 
 /**
  * Маршрут у «скомпільованому» вигляді — усе, що диспетчеру треба для одного
@@ -23,6 +24,11 @@ export interface CompiledRoute {
    * індексом `@Body()` звідси беремо клас DTO, у який перетворювати тіло.
    */
   paramTypes: unknown[];
+  /**
+   * Guard-класи для цього маршруту (класові + методні `@UseGuards`). Диспетчер
+   * створить їх через контейнер і викличе `canActivate` ДО обробника.
+   */
+  guards: GuardClass[];
 }
 
 /** Результат матчингу: маршрут + витягнуті значення `:param`-сегментів. */
@@ -61,6 +67,7 @@ export class Router {
         params: getParamMap(controller, route.handlerName),
         paramTypes:
           Reflect.getMetadata('design:paramtypes', proto, route.handlerName) ?? [],
+        guards: getGuards(controller, route.handlerName),
       });
     }
 
