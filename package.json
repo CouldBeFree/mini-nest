@@ -1,7 +1,7 @@
 {
   "name": "mini-nest",
   "version": "1.0.0",
-  "description": "Мінімальний IoC-контейнер у стилі NestJS — читає design:paramtypes і сам збирає граф залежностей (частина 1 з 3).",
+  "description": "Мінімальний фреймворк у стилі NestJS поверх node:http: IoC-контейнер, маршрутизація на декораторах і повний життєвий цикл запиту (guard → interceptor → pipe → handler → filter) з requestId через AsyncLocalStorage.",
   "type": "commonjs",
   "main": "dist/src/index.js",
   "scripts": {
@@ -29,8 +29,7 @@
     "typescript": "^6.0.3"
   },
   "dependencies": {
-    "class-transformer": "^0.5.1",
-    "class-validator": "^0.15.1",
-    "reflect-metadata": "^0.2.2"
+    "reflect-metadata": "^0.2.2",
+    "zod": "^4.4.3"
   }
 }

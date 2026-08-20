@@ -1,7 +1,7 @@
 import { Controller } from '../decorators/controller';
 import { Get, Post } from '../decorators/methods';
 import { Body, Param, Query } from '../decorators/params';
-import { HttpResponse } from '../dispatcher';
+import { NotFoundError } from '../http/exceptions';
 import { CreateUserDto } from '../dto/create-user.dto';
 import { UserService } from './user.service';
 
@@ -27,12 +27,16 @@ export class UserController {
     return this.users.findAll(parsed);
   }
 
-  /** GET /users/:id — `id` приходить із сегмента маршруту, не з `req`. */
+  /**
+   * GET /users/:id — `id` приходить із сегмента маршруту, не з `req`.
+   * Немає такого користувача → кидаємо доменну `NotFoundError`; у HTTP-статус
+   * `404` її перетворить Exception Filter, а не контролер.
+   */
   @Get(':id')
   getOne(@Param('id') id: string) {
     const user = this.users.findOne(Number(id));
     if (!user) {
-      return new HttpResponse(404, { statusCode: 404, message: `User ${id} not found` });
+      throw new NotFoundError(`User ${id} not found`);
     }
     return user;
   }

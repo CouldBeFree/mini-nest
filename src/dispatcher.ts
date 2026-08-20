@@ -2,95 +2,83 @@ import 'reflect-metadata';
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { Container } from './container';
-import { Router, type CompiledRoute, type RouteMatch } from './router';
-import { ValidationPipe, ValidationError } from './pipes/validation.pipe';
+import { Router, type CompiledRoute } from './router';
+import { ZodValidationPipe } from './pipes/zod-validation.pipe';
+import { AllExceptionsFilter } from './filters/exception.filter';
+import {
+  HttpResponse,
+  type ArgumentMetadata,
+  type CanActivate,
+  type ExceptionFilter,
+  type ExecutionContext,
+  type Interceptor,
+  type Middleware,
+  type Next,
+  type PipeTransform,
+} from './http/lifecycle';
+import {
+  ForbiddenError,
+  MalformedJsonError,
+  NotFoundError,
+  PayloadTooLargeError,
+} from './http/exceptions';
+import {
+  getRequestId,
+  resolveRequestId,
+  runWithRequestContext,
+} from './context/request-context';
 import type { Constructor } from './tokens';
 import type { ParamMeta } from './decorators/params';
 
-/** Дозволяє обробнику самому задати HTTP-статус, не втрачаючи тіло-обʼєкт. */
-export class HttpResponse<T = unknown> {
-  constructor(
-    public readonly status: number,
-    public readonly body: T,
-  ) {}
-}
-
-/** Тіло запиту перевищило ліміт байтів — диспетчер відповість `413`. */
-export class PayloadTooLargeError extends Error {
-  constructor(public readonly limit: number) {
-    super(`Request body exceeds limit of ${limit} bytes`);
-    this.name = 'PayloadTooLargeError';
-  }
-}
+// Реекспорт публічних типів/класів, щоб споживачі імпортували їх зі звичного
+// місця (`../dispatcher`), не знаючи про внутрішній розклад по модулях.
+export { HttpResponse } from './http/lifecycle';
+export type {
+  ExecutionContext,
+  Middleware,
+  Next,
+  CanActivate,
+  Interceptor,
+  PipeTransform,
+  ExceptionFilter,
+} from './http/lifecycle';
+export { PayloadTooLargeError } from './http/exceptions';
 
 /** Стеля розміру тіла за замовчуванням — 1 MiB. */
 export const DEFAULT_MAX_BODY_BYTES = 1024 * 1024;
 
 /**
- * Контекст виконання одного запиту — усе, що ланки ланцюжка бачать навколо
- * виклику обробника. Саме сюди ДЗ#8 (guards / interceptors) дивитиметься, щоб
- * вирішити «пускати далі?» чи «як трансформувати результат»: маршрут і його
- * метадані є в `route`, залежності — через `container`, аргументи методу —
- * у мутабельному `args` (інтерсептор може їх підмінити ДО виклику).
- */
-export interface ExecutionContext {
-  readonly req: http.IncomingMessage;
-  readonly res: http.ServerResponse;
-  readonly url: URL;
-  readonly route: CompiledRoute;
-  readonly pathParams: Record<string, string>;
-  readonly container: Container;
-  /** Екземпляр контролера з контейнера. */
-  readonly controller: Record<string, (...a: unknown[]) => unknown>;
-  /** Імʼя методу-обробника на контролері. */
-  readonly handlerName: string;
-  /** Аргументи для методу (після пайпів); ланка може змінити їх до `next()`. */
-  args: unknown[];
-}
-
-/** Наступна ланка: викликає решту ланцюжка й повертає результат обробника. */
-export type Next = () => Promise<unknown>;
-
-/**
- * Ланка навколо виклику обробника (onion-стиль, як у Nest interceptors).
- * Викликає `next()` — і те, що поверне, може лишити як є, обгорнути або
- * підмінити; або **не** викликати `next()` зовсім — тоді обробник не
- * запуститься (так поводиться guard, що відхиляє запит).
- */
-export type Middleware = (ctx: ExecutionContext, next: Next) => Promise<unknown>;
-
-/**
- * Диспетчер: HTTP-шар поверх `node:http`.
+ * Диспетчер: HTTP-шар поверх `node:http`, що проводить кожен запит крізь повний
+ * життєвий цикл Лекції 8:
  *
- * Життєвий цикл запиту:
- *   1) розібрати URL (шлях + query);
- *   2) знайти маршрут у роутері (`404`, якщо збігу немає);
- *   3) за потреби зчитати й розпарсити JSON-тіло (`400` на битий JSON,
- *      `413`, якщо тіло перевищує ліміт байтів);
- *   4) зібрати масив аргументів за мапою параметр-декораторів
- *      (@Body проходить через ValidationPipe → `400` на невалідне тіло);
- *   5) дістати екземпляр контролера з контейнера (частина 1) і викликати метод
- *      через ланцюжок ланок (`#runChain`) — точка розширення для ДЗ#8
- *      (guards / interceptors); без зареєстрованих ланок це просто виклик методу;
- *   6) серіалізувати результат у JSON.
+ *   Middleware → Guard → Interceptor(before) → Pipe → Handler
+ *              → Interceptor(after) → Exception Filter
+ *
+ * Стадії — не «вшиті лінійно», а композований onion-ланцюг (`#runLifecycle`):
+ * middleware — найзовнішні, всередині них guard, далі interceptors, а в самому
+ * осерді — pipe (складання+валідація аргументів) і виклик обробника. Увесь цикл
+ * обгорнуто в один try/catch, останню ланку якого тримає Exception Filter.
+ *
+ * Кожен запит виконується у власному контексті `AsyncLocalStorage` (requestId),
+ * тож будь-який код глибоко в стеку дістає id без передачі параметром, а
+ * відповідь несе його в заголовку `X-Request-Id`.
  */
 export class Dispatcher {
   readonly #router = new Router();
-  readonly #pipe = new ValidationPipe();
-  /**
-   * Ланки навколо виклику обробника. Порожній список = виклик «як є» (поточна
-   * поведінка). ДЗ#8 додаватиме сюди guards/interceptors через `use(...)`,
-   * не чіпаючи `#dispatch`.
-   */
-  readonly #chain: Middleware[] = [];
+  /** Вбудований pipe валідації тіла — працює завжди, без реєстрації (регресія ДЗ#7). */
+  readonly #bodyPipe = new ZodValidationPipe();
+  readonly #defaultFilter = new AllExceptionsFilter();
+
+  readonly #middleware: Middleware[] = [];
+  readonly #guards: CanActivate[] = [];
+  readonly #interceptors: Interceptor[] = [];
+  readonly #pipes: PipeTransform[] = [];
+  readonly #filters: ExceptionFilter[] = [];
 
   /**
-   * Контейнер приходить ззовні — той самий, що й у частині 1. Завдяки цьому
-   * контролери й сервіси живуть як singletons: сервіс, який дістане тест, — той
-   * самий екземпляр, що інжектнутий у контролер.
-   *
-   * `maxBodyBytes` — стеля розміру тіла запиту; за перевищенням читання
-   * припиняється й повертається `413` (див. `#readJson`).
+   * Контейнер приходить ззовні — той самий, що й у частині 1 (сервіси й
+   * контролери як singletons). `maxBodyBytes` — стеля розміру тіла: за
+   * перевищенням читання припиняється й повертається `413`.
    */
   constructor(
     private readonly container: Container = new Container(),
@@ -103,23 +91,53 @@ export class Dispatcher {
     return this;
   }
 
-  /**
-   * Додати ланки навколо виклику обробника (у порядку реєстрації — зовнішні
-   * першими). Це точка розширення для ДЗ#8: guards, interceptors, filters
-   * підключаються сюди, а `#dispatch` лишається незмінним.
-   */
+  /** Додати middleware — найзовнішні ланки циклу (onion, у порядку реєстрації). */
   use(...middleware: Middleware[]): this {
-    this.#chain.push(...middleware);
+    this.#middleware.push(...middleware);
     return this;
   }
 
-  /** `http.RequestListener` — сюди приходить кожен HTTP-запит. */
+  /** Додати глобальні guards (виконуються до обробника для всіх маршрутів). */
+  useGuards(...guards: CanActivate[]): this {
+    this.#guards.push(...guards);
+    return this;
+  }
+
+  /** Додати глобальні interceptors (обгортають виклик обробника). */
+  useInterceptors(...interceptors: Interceptor[]): this {
+    this.#interceptors.push(...interceptors);
+    return this;
+  }
+
+  /** Додати глобальні pipes (трансформують кожен аргумент перед обробником). */
+  usePipes(...pipes: PipeTransform[]): this {
+    this.#pipes.push(...pipes);
+    return this;
+  }
+
+  /** Додати exception-фільтри (пробуються перед вбудованим; перший, що вернув відповідь, — виграє). */
+  useFilters(...filters: ExceptionFilter[]): this {
+    this.#filters.push(...filters);
+    return this;
+  }
+
+  /** `http.RequestListener` — точка входу кожного HTTP-запиту. */
   readonly handle: http.RequestListener = (req, res) => {
-    // Не даємо жодному винятку «прорватись» повз відповідь.
-    this.#dispatch(req, res).catch((err) => {
-      this.#send(res, 500, {
-        statusCode: 500,
-        message: err instanceof Error ? err.message : 'Internal Server Error',
+    // Кожен запит — у власному контексті ALS з наскрізним requestId. Обгортаємо
+    // ВЕСЬ обробник, тож усе, що з нього породиться (навіть після await), бачить
+    // саме цей store.
+    const store = { requestId: resolveRequestId(req.headers['x-request-id']) };
+    runWithRequestContext(store, () => {
+      // #dispatch має власний try/catch (→ Exception Filter). Цей .catch — лише
+      // остання сітка безпеки, якщо впав сам шлях обробки помилки.
+      this.#dispatch(req, res).catch(() => {
+        if (!res.writableEnded) {
+          try {
+            this.#send(res, 500, { statusCode: 500, message: 'Internal Server Error' });
+          } catch {
+            /* нічого не вдіємо — з'єднання вже мертве */
+          }
+        }
       });
     });
   };
@@ -139,110 +157,104 @@ export class Dispatcher {
   }
 
   async #dispatch(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
-    const url = new URL(req.url ?? '/', 'http://localhost');
-    const match = this.#router.match(req.method ?? 'GET', url.pathname);
-
-    if (!match) {
-      this.#send(res, 404, {
-        statusCode: 404,
-        message: `Cannot ${req.method} ${url.pathname}`,
-      });
-      return;
-    }
-
-    let args: unknown[];
+    let ctx: ExecutionContext | undefined;
     try {
-      // Сире тіло читаємо лише коли метод справді очікує @Body().
-      const rawBody = this.#needsBody(match.route)
-        ? await this.#readJson(req)
-        : undefined;
-      args = await this.#buildArgs(match, url, rawBody);
+      const url = new URL(req.url ?? '/', 'http://localhost');
+      const match = this.#router.match(req.method ?? 'GET', url.pathname);
+      if (!match) {
+        throw new NotFoundError(`Cannot ${req.method} ${url.pathname}`);
+      }
+
+      // Контейнер із частини 1 створює контролер і всі його залежності.
+      const controller = this.container.resolve(match.route.controller) as Record<
+        string,
+        (...a: unknown[]) => unknown
+      >;
+
+      ctx = {
+        req,
+        res,
+        url,
+        route: match.route,
+        pathParams: match.pathParams,
+        container: this.container,
+        controller,
+        handlerName: match.route.handlerName,
+        args: [],
+      };
+
+      const result = await this.#runLifecycle(ctx);
+
+      if (result instanceof HttpResponse) {
+        this.#send(res, result.status, result.body);
+        return;
+      }
+      // POST за замовчуванням — 201 Created, решта — 200 OK (як у Nest).
+      this.#send(res, match.route.method === 'POST' ? 201 : 200, result);
     } catch (err) {
-      if (err instanceof ValidationError) {
-        this.#send(res, 400, {
-          statusCode: 400,
-          message: 'Validation failed',
-          errors: err.errors,
-        });
-        return;
-      }
-      if (err instanceof SyntaxError) {
-        this.#send(res, 400, { statusCode: 400, message: err.message });
-        return;
-      }
-      if (err instanceof PayloadTooLargeError) {
-        this.#send(res, 413, { statusCode: 413, message: err.message });
-        // Відповідь пішла — тепер обриваємо недочитане завантаження, щоб клієнт,
-        // який ще шле тіло, не тримав зʼєднання відкритим.
-        req.destroy();
-        return;
-      }
-      throw err; // інше — у 500-обгортку в handle()
+      // Останній у циклі — Exception Filter: будь-яка помилка (guard/interceptor/
+      // pipe/handler/читання тіла) стає HTTP-відповіддю тут.
+      this.#handleError(req, res, err, ctx);
     }
-
-    // Контейнер із частини 1 створює контролер і всі його залежності.
-    const controller = this.container.resolve(match.route.controller) as Record<
-      string,
-      (...a: unknown[]) => unknown
-    >;
-
-    // Виклик обробника йде через ланцюжок: без ланок — це просто виклик методу,
-    // із ланками (ДЗ#8) — guards/interceptors навколо нього.
-    const ctx: ExecutionContext = {
-      req,
-      res,
-      url,
-      route: match.route,
-      pathParams: match.pathParams,
-      container: this.container,
-      controller,
-      handlerName: match.route.handlerName,
-      args,
-    };
-    const result = await this.#runChain(ctx);
-
-    if (result instanceof HttpResponse) {
-      this.#send(res, result.status, result.body);
-      return;
-    }
-    // POST за замовчуванням — 201 Created, решта — 200 OK (як у Nest).
-    this.#send(res, match.route.method === 'POST' ? 201 : 200, result);
   }
 
   /**
-   * Скласти onion-ланцюжок навколо виклику обробника й запустити його.
+   * Скласти й запустити onion-ланцюг усього циклу.
    *
-   * Термінальна ланка — власне виклик методу контролера. `reduceRight`
-   * обгортає її ланками у зворотному порядку, тож зовнішня ланка бачить `next`,
-   * який веде до наступної і врешті — до самого обробника. Порожній `#chain`
-   * дає рівно `terminal()` — тобто поведінку «виклик як є», без накладних.
+   * Термінальна ланка — pipe (складання+валідація аргументів) і виклик обробника.
+   * Її обгортають, зсередини назовні: interceptors, потім guard-ланка, потім
+   * middleware. Тому виконання йде рівно в порядку
+   *   middleware → guard → interceptor(before) → pipe → handler → interceptor(after).
+   * Guard стоїть ДО pipe навмисно: неавторизований запит відсікаємо, не читаючи
+   * й не валідуючи його тіло.
    */
-  #runChain(ctx: ExecutionContext): Promise<unknown> {
-    const terminal: Next = () =>
-      Promise.resolve(ctx.controller[ctx.handlerName](...ctx.args));
+  #runLifecycle(ctx: ExecutionContext): Promise<unknown> {
+    const terminal: Next = async () => {
+      ctx.args = await this.#buildArgs(ctx); // ← pipe-стадія
+      return ctx.controller[ctx.handlerName](...ctx.args); // ← handler
+    };
 
-    const composed = this.#chain.reduceRight<Next>(
-      (next, middleware) => () => middleware(ctx, next),
+    // Guard-ланка: проганяє всі guards; якщо хтось відмовив — кидає ForbiddenError
+    // (→ фільтр → 403) і `next()` не викликає, тож нічого глибше не виконається.
+    const guardLink: Middleware = async (c, next) => {
+      await this.#runGuards(c);
+      return next();
+    };
+
+    // Interceptors зводимо до тієї ж форми ланки, що й middleware.
+    const interceptorLinks: Middleware[] = this.#interceptors.map(
+      (i) => (c, next) => i.intercept(c, next),
+    );
+
+    const links: Middleware[] = [...this.#middleware, guardLink, ...interceptorLinks];
+    const composed = links.reduceRight<Next>(
+      (next, link) => () => link(ctx, next),
       terminal,
     );
     return composed();
   }
 
-  /** Чи має цей маршрут хоч один параметр із джерелом `body`. */
-  #needsBody(route: CompiledRoute): boolean {
-    return Object.values(route.params).some((p) => p.source === 'body');
+  /** Проганяємо глобальні, потім маршрутні guards. `false` → `403`, обробник не буде. */
+  async #runGuards(ctx: ExecutionContext): Promise<void> {
+    for (const guard of this.#guards) {
+      if (!(await guard.canActivate(ctx))) throw new ForbiddenError();
+    }
+    for (const GuardClass of ctx.route.guards) {
+      const guard = this.container.resolve(GuardClass);
+      if (!(await guard.canActivate(ctx))) throw new ForbiddenError();
+    }
   }
 
   /**
-   * Побудова масиву аргументів за мапою параметрів. Ключ мапи — індекс
-   * аргументу, тож ми кладемо кожне значення рівно на його позицію.
+   * Pipe-стадія: за мапою параметр-декораторів дістаємо кожне значення на його
+   * позицію, проганяємо @Body через вбудований Zod-pipe, а потім кожен аргумент —
+   * через глобальні pipes. Тіло читаємо саме тут (а не раніше), тож guard устигає
+   * відсікти запит до читання/валідації.
    */
-  async #buildArgs(
-    match: RouteMatch,
-    url: URL,
-    rawBody: unknown,
-  ): Promise<unknown[]> {
-    const { route, pathParams } = match;
+  async #buildArgs(ctx: ExecutionContext): Promise<unknown[]> {
+    const { route, url, pathParams, req } = ctx;
+    const rawBody = this.#needsBody(route) ? await this.#readJson(req) : undefined;
+
     const count = Math.max(
       route.paramTypes.length,
       ...Object.keys(route.params).map((i) => Number(i) + 1),
@@ -253,53 +265,69 @@ export class Dispatcher {
     for (let i = 0; i < count; i++) {
       const meta: ParamMeta | undefined = route.params[i];
       if (!meta) continue;
-      args[i] = await this.#extract(meta, url, pathParams, rawBody, route.paramTypes[i]);
+
+      const metadata: ArgumentMetadata = {
+        source: meta.source,
+        metatype: route.paramTypes[i],
+        name: meta.name,
+      };
+
+      let value = this.#extract(meta, url, pathParams, rawBody);
+      // @Body() спершу через вбудований pipe валідації (валідне → екземпляр DTO).
+      if (meta.source === 'body') {
+        value = await this.#bodyPipe.transform(value, metadata);
+      }
+      // Далі — глобальні pipes (застосовуються до кожного аргументу).
+      for (const pipe of this.#pipes) {
+        value = await pipe.transform(value, metadata);
+      }
+      args[i] = value;
     }
     return args;
   }
 
-  /** Дістати одне значення за описом параметр-декоратора. */
-  async #extract(
+  /** Дістати сире значення аргументу за описом параметр-декоратора. */
+  #extract(
     meta: ParamMeta,
     url: URL,
     pathParams: Record<string, string>,
     rawBody: unknown,
-    metatype: unknown,
-  ): Promise<unknown> {
+  ): unknown {
     switch (meta.source) {
       case 'param':
         return pathParams[meta.name as string];
       case 'query':
         return url.searchParams.get(meta.name as string) ?? undefined;
       case 'body':
-        // @Body() проходить через ValidationPipe: валідне → екземпляр DTO.
-        return this.#pipe.transform(rawBody ?? {}, metatype as Constructor);
+        return rawBody ?? {};
     }
+  }
+
+  /** Чи має цей маршрут хоч один параметр із джерелом `body`. */
+  #needsBody(route: CompiledRoute): boolean {
+    return Object.values(route.params).some((p) => p.source === 'body');
   }
 
   /**
    * Зібрати чанки тіла й розпарсити JSON. Порожнє тіло → `{}`.
    *
    * Рахуємо накопичені байти й на перевищенні `maxBodyBytes` зупиняємо потік і
-   * кидаємо `PayloadTooLargeError` — інакше достатньо великий (чи нескінченний)
-   * POST роздув би памʼять процесу. Сокет НЕ рвемо тут (413-відповідь не встигла
-   * б піти) — обрив робить обробник помилок у #dispatch після відповіді.
+   * кидаємо `PayloadTooLargeError` — інакше великий (чи нескінченний) POST роздув
+   * би памʼять. Сокет НЕ рвемо тут (413-відповідь не встигла б піти) — обрив
+   * робить `#handleError` уже ПІСЛЯ відправлення відповіді.
    */
   #readJson(req: http.IncomingMessage): Promise<unknown> {
     return new Promise((resolve, reject) => {
       const chunks: Buffer[] = [];
       let size = 0;
-      let done = false; // щоб не обробляти 'end' після аварійного розриву
+      let done = false; // щоб не обробляти 'end' після аварійної зупинки
 
       req.on('data', (chunk: Buffer) => {
         if (done) return;
         size += chunk.length;
         if (size > this.maxBodyBytes) {
           done = true;
-          // Зупиняємо потік (більше нічого не буферимо), але НЕ рвемо сокет —
-          // інакше 413-відповідь не встигне піти. Обрив зробить обробник помилок
-          // у #dispatch уже ПІСЛЯ того, як відповідь відправлено.
-          req.pause();
+          req.pause(); // припиняємо буферити, але НЕ рвемо сокет (див. коментар вище)
           reject(new PayloadTooLargeError(this.maxBodyBytes));
           return;
         }
@@ -317,15 +345,44 @@ export class Dispatcher {
         try {
           resolve(JSON.parse(raw));
         } catch {
-          reject(new SyntaxError('Malformed JSON in request body'));
+          reject(new MalformedJsonError());
         }
       });
     });
   }
 
-  /** Єдина точка серіалізації відповіді у JSON. */
+  /**
+   * Прогнати помилку крізь фільтри (спершу зареєстровані, тоді вбудований, що
+   * завжди дає відповідь) і відправити результат. Для `413` після відповіді
+   * рвемо сокет, щоб клієнт не тримав недочитане завантаження.
+   */
+  #handleError(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    err: unknown,
+    ctx?: ExecutionContext,
+  ): void {
+    if (res.writableEnded) return;
+    for (const filter of [...this.#filters, this.#defaultFilter]) {
+      const response = filter.catch(err, ctx);
+      if (response) {
+        this.#send(res, response.status, response.body);
+        if (err instanceof PayloadTooLargeError) req.destroy();
+        return;
+      }
+    }
+  }
+
+  /** Єдина точка серіалізації відповіді в JSON. Сюди ж чіпляємо `X-Request-Id`. */
   #send(res: http.ServerResponse, status: number, body: unknown): void {
-    res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+    const headers: http.OutgoingHttpHeaders = {
+      'Content-Type': 'application/json; charset=utf-8',
+    };
+    // Той самий id, що й у решти коду цього запиту — беремо зі сховища ALS.
+    const requestId = getRequestId();
+    if (requestId) headers['X-Request-Id'] = requestId;
+
+    res.writeHead(status, headers);
     res.end(body === undefined ? '' : JSON.stringify(body));
   }
 }
